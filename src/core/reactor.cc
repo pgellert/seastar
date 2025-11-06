@@ -3146,6 +3146,7 @@ reactor::task_queue_group::insert_activating_entities() {
 void reactor::add_task(task* t) noexcept {
     auto sg = t->group();
     auto* q = _task_queues[sg._id].get();
+    SEASTAR_ASSERT(q != nullptr && "cannot add task to unregistered scheduling group");
     bool was_empty = q->_q.empty();
     q->_q.push_back(std::move(t));
     shuffle(q->_q.back(), q->_q);
@@ -3158,6 +3159,7 @@ void reactor::add_urgent_task(task* t) noexcept {
     memory::scoped_critical_alloc_section _;
     auto sg = t->group();
     auto* q = _task_queues[sg._id].get();
+    SEASTAR_ASSERT(q != nullptr && "cannot add urgent task to unregistered scheduling group");
     bool was_empty = q->_q.empty();
     q->_q.push_front(std::move(t));
     shuffle(q->_q.front(), q->_q);
