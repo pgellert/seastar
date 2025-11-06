@@ -72,6 +72,7 @@ module seastar;
 #include <seastar/core/gate.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/with_timeout.hh>
+#include <seastar/core/with_scheduling_group.hh>
 #include <seastar/net/stack.hh>
 #include <seastar/net/tls.hh>
 #include <seastar/util/defer.hh>
@@ -1642,23 +1643,28 @@ public:
         // only do once.
         if (!std::exchange(_shutdown, true)) {
             tls_log.trace("{} close: performing shutdown", *this);
-            // running in background. try to bye-handshake us nicely, but after 10s we forcefully close.
-            engine().run_in_background(with_timeout(
-              timer<>::clock::now() + std::chrono::seconds(10), shutdown())
-              .finally([this] {
-                  _eof = true;
-                  return _in.close();
-              }).finally([this] {
-                  return _out.close();
-              }).finally([this] {
-                  // make sure to wait for handshake attempt to leave semaphores. Must be in same order as
-                  // handshake aqcuire, because in worst case, we get here while a reader is attempting
-                  // re-handshake.
-                  return with_semaphore(_in_sem, 1, [this] {
-                      return with_semaphore(_out_sem, 1, [] { });
-                  });
-              }).handle_exception([me = shared_from_this()](std::exception_ptr){
-              }).discard_result());
+            // running in background. try to bye-handshake us nicely, but after 10s we forcefully
+            // close. run on the main scheduling group as that has a lifetime longer than this
+            // background fibre
+            (void)with_scheduling_group(
+              default_scheduling_group(), [this, me = shared_from_this()]() mutable {
+                engine().run_in_background(with_timeout(
+                  timer<>::clock::now() + std::chrono::seconds(10), shutdown())
+                    .finally([this] {
+                        _eof = true;
+                        return _in.close();
+                    })
+                    .finally([this] { return _out.close(); })
+                    .finally([this] {
+                        // make sure to wait for handshake attempt to leave semaphores. Must be in
+                        // same order as handshake aqcuire, because in worst case, we get here while
+                        // a reader is attempting re-handshake.
+                        return with_semaphore(
+                          _in_sem, 1, [this] { return with_semaphore(_out_sem, 1, [] {}); });
+                    })
+                    .handle_exception([me = std::move(me)](std::exception_ptr) {})
+                    .discard_result());
+            });
         }
     }
     // helper for sink
