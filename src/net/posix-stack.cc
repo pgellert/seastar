@@ -561,83 +561,262 @@ local_proxy_protocol_v2_header(const pollable_fd& pfd) {
     return header;
 }
 
-// Parses proxy protocol v2 header; returns std::nullopt if no valid header is found.
+// Parses proxy protocol header (auto-detects v1 or v2); returns std::nullopt if no valid header is found.
 static
 future<std::optional<proxy_protocol_v2_header>>
-read_proxy_protocol_v2_header(pollable_fd& fd) {
-    constexpr size_t pp2_header_len = 16;
-    char header_buf[pp2_header_len];
-    auto n_read = co_await fd.read_some(header_buf, pp2_header_len);
-    if (n_read < pp2_header_len) {
+read_proxy_protocol_header(pollable_fd& fd) {
+    // Read first 12 bytes to distinguish v1 from v2
+    constexpr size_t peek_len = 12;
+    char peek_buf[peek_len];
+    auto n_read = co_await fd.read_some(peek_buf, peek_len);
+    if (n_read < peek_len) {
         co_return std::nullopt;
     }
+
+    // Check for v2 signature
     static const char pp2_signature[12] = {
         0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
     };
-    if (std::memcmp(header_buf, pp2_signature, sizeof(pp2_signature)) != 0) {
-        co_return std::nullopt;
-    }
 
-    auto len = read_be<uint16_t>(header_buf + 14);
+    if (std::memcmp(peek_buf, pp2_signature, sizeof(pp2_signature)) == 0) {
+        // Proxy protocol v2
+        constexpr size_t pp2_header_len = 16;
+        char header_buf[pp2_header_len];
+        std::memcpy(header_buf, peek_buf, peek_len);
 
-    char stack_buffer[36]; // Suitable for IPv6 without extra TLVs
-    std::unique_ptr<char[]> heap_buffer;
-    auto* buffer = stack_buffer;
-
-    if (len > sizeof(stack_buffer)) {
-        heap_buffer = std::make_unique<char[]>(len);
-        buffer = heap_buffer.get();
-    }
-
-    auto xlen = co_await fd.read_some(buffer, len);
-    if (xlen < len) {
-        co_return std::nullopt;
-    }
-
-    uint8_t fam_proto = header_buf[13];
-    switch (header_buf[12]) { // version and command
-    case 0x20: // v2, LOCAL
-        if (fam_proto != 0x00) { // UNSPEC
+        // Read remaining 4 bytes of header
+        auto n_read2 = co_await fd.read_some(header_buf + peek_len, pp2_header_len - peek_len);
+        if (n_read2 < pp2_header_len - peek_len) {
             co_return std::nullopt;
         }
-        co_return local_proxy_protocol_v2_header(fd);
-    case 0x21: // v2, PROXY
-        // Mainline continues after the switch
-        break;
-    default:   // Not defined, must reject
-        co_return std::nullopt;
-    }
 
-    auto fam = fam_proto >> 4;
-    auto proto = fam_proto & 0x0F;
+        auto len = read_be<uint16_t>(header_buf + 14);
 
-    if (proto != 0x1) { // STREAM
-        co_return std::nullopt;
-    }
+        char stack_buffer[36]; // Suitable for IPv6 without extra TLVs
+        std::unique_ptr<char[]> heap_buffer;
+        auto* buffer = stack_buffer;
 
-    proxy_protocol_v2_header header;
+        if (len > sizeof(stack_buffer)) {
+            heap_buffer = std::make_unique<char[]>(len);
+            buffer = heap_buffer.get();
+        }
 
-    switch (fam) {
-    case 0x1: { // INET
-        if (len < 12) {
+        auto xlen = co_await fd.read_some(buffer, len);
+        if (xlen < len) {
             co_return std::nullopt;
         }
-        header.remote_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer)), read_be<uint16_t>(buffer + 8));
-        header.local_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer + 4)), read_be<uint16_t>(buffer + 10));
-        break;
-    }
-    case 0x2: { // INET6
-        if (len < 36) {
+
+        uint8_t fam_proto = header_buf[13];
+        switch (header_buf[12]) { // version and command
+        case 0x20: // v2, LOCAL
+            if (fam_proto != 0x00) { // UNSPEC
+                co_return std::nullopt;
+            }
+            co_return local_proxy_protocol_v2_header(fd);
+        case 0x21: // v2, PROXY
+            // Mainline continues after the switch
+            break;
+        default:   // Not defined, must reject
             co_return std::nullopt;
         }
-        header.remote_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer)), read_be<uint16_t>(buffer + 32));
-        header.local_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer + 16)), read_be<uint16_t>(buffer + 34));
-        break;
-    }
-    default:
+
+        auto fam = fam_proto >> 4;
+        auto proto = fam_proto & 0x0F;
+
+        if (proto != 0x1) { // STREAM
+            co_return std::nullopt;
+        }
+
+        proxy_protocol_v2_header header;
+
+        switch (fam) {
+        case 0x1: { // INET
+            if (len < 12) {
+                co_return std::nullopt;
+            }
+            header.remote_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer)), read_be<uint16_t>(buffer + 8));
+            header.local_address = ipv4_addr(inet_address(copy_reinterpret_cast<in_addr>(buffer + 4)), read_be<uint16_t>(buffer + 10));
+            break;
+        }
+        case 0x2: { // INET6
+            if (len < 36) {
+                co_return std::nullopt;
+            }
+            header.remote_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer)), read_be<uint16_t>(buffer + 32));
+            header.local_address = ipv6_addr(inet_address(copy_reinterpret_cast<in6_addr>(buffer + 16)), read_be<uint16_t>(buffer + 34));
+            break;
+        }
+        default:
+            co_return std::nullopt;
+        }
+        co_return header;
+    } else if (std::memcmp(peek_buf, "PROXY ", 6) == 0) {
+        // Proxy protocol v1
+        // We've already read 12 bytes, need to find CRLF and parse the rest
+        constexpr size_t max_line_len = 109; // 107 chars + CRLF
+        char line_buf[max_line_len];
+        std::memcpy(line_buf, peek_buf, peek_len);
+        size_t pos = peek_len;
+
+        // Read all remaining possible bytes in one shot (like v2 does with its length field)
+        // This minimizes syscalls to 2 total (peek + remaining), matching v2's pattern
+        constexpr size_t remaining_max = max_line_len - peek_len;
+        auto n_read = co_await fd.read_some(line_buf + pos, remaining_max);
+        if (n_read == 0) {
+            co_return std::nullopt;
+        }
+
+        // Search for CRLF in the data we received
+        for (size_t i = 0; i < n_read; ++i) {
+            if (pos + i >= 1 && line_buf[pos + i - 1] == '\r' && line_buf[pos + i] == '\n') {
+                pos = pos + i + 1;
+                goto found_crlf;
+            }
+        }
+
+        // CRLF not found in data received - header is incomplete or malformed
         co_return std::nullopt;
+
+    found_crlf:
+        // Must have found CRLF
+        if (pos < 2 || line_buf[pos - 2] != '\r' || line_buf[pos - 1] != '\n') {
+            co_return std::nullopt;
+        }
+
+        // Null-terminate for parsing (overwrites \r)
+        line_buf[pos - 2] = '\0';
+        std::string_view line(line_buf, pos - 2);
+
+        // Must start with "PROXY " (already verified above)
+        line.remove_prefix(6); // Remove "PROXY "
+
+        // Parse protocol family
+        std::string_view protocol;
+        auto space_pos = line.find(' ');
+        if (space_pos == std::string_view::npos) {
+            // Could be "UNKNOWN" without addresses
+            if (line == "UNKNOWN") {
+                co_return local_proxy_protocol_v2_header(fd);
+            }
+            co_return std::nullopt;
+        }
+
+        protocol = line.substr(0, space_pos);
+        line.remove_prefix(space_pos + 1);
+
+        if (protocol == "UNKNOWN") {
+            co_return local_proxy_protocol_v2_header(fd);
+        }
+
+        // Parse addresses and ports
+        // Format: src_addr dst_addr src_port dst_port
+        std::string_view src_addr_str, dst_addr_str, src_port_str, dst_port_str;
+
+        space_pos = line.find(' ');
+        if (space_pos == std::string_view::npos) {
+            co_return std::nullopt;
+        }
+        src_addr_str = line.substr(0, space_pos);
+        line.remove_prefix(space_pos + 1);
+
+        space_pos = line.find(' ');
+        if (space_pos == std::string_view::npos) {
+            co_return std::nullopt;
+        }
+        dst_addr_str = line.substr(0, space_pos);
+        line.remove_prefix(space_pos + 1);
+
+        space_pos = line.find(' ');
+        if (space_pos == std::string_view::npos) {
+            co_return std::nullopt;
+        }
+        src_port_str = line.substr(0, space_pos);
+        line.remove_prefix(space_pos + 1);
+
+        dst_port_str = line;
+
+        // Helper to parse port from string_view without allocation
+        auto parse_port = [](std::string_view sv) -> std::optional<uint16_t> {
+            if (sv.empty() || sv.size() > 5) {
+                return std::nullopt;
+            }
+            uint32_t port = 0;
+            for (char c : sv) {
+                if (c < '0' || c > '9') {
+                    return std::nullopt;
+                }
+                port = port * 10 + (c - '0');
+                if (port > 65535) {
+                    return std::nullopt;
+                }
+            }
+            return static_cast<uint16_t>(port);
+        };
+
+        auto src_port_opt = parse_port(src_port_str);
+        auto dst_port_opt = parse_port(dst_port_str);
+        if (!src_port_opt || !dst_port_opt) {
+            co_return std::nullopt;
+        }
+
+        proxy_protocol_v2_header header;
+
+        // Helper to convert string_view to null-terminated stack buffer for inet_pton
+        auto to_cstr = [](std::string_view sv, char* buf, size_t bufsize) -> const char* {
+            if (sv.size() >= bufsize) {
+                return nullptr;
+            }
+            std::memcpy(buf, sv.data(), sv.size());
+            buf[sv.size()] = '\0';
+            return buf;
+        };
+
+        char src_addr_buf[INET6_ADDRSTRLEN];
+        char dst_addr_buf[INET6_ADDRSTRLEN];
+
+        if (protocol == "TCP4") {
+            // Parse IPv4 addresses
+            struct in_addr src_in, dst_in;
+            const char* src_cstr = to_cstr(src_addr_str, src_addr_buf, sizeof(src_addr_buf));
+            const char* dst_cstr = to_cstr(dst_addr_str, dst_addr_buf, sizeof(dst_addr_buf));
+            if (!src_cstr || !dst_cstr) {
+                co_return std::nullopt;
+            }
+            if (inet_pton(AF_INET, src_cstr, &src_in) != 1) {
+                co_return std::nullopt;
+            }
+            if (inet_pton(AF_INET, dst_cstr, &dst_in) != 1) {
+                co_return std::nullopt;
+            }
+
+            header.remote_address = ipv4_addr(inet_address(src_in), *src_port_opt);
+            header.local_address = ipv4_addr(inet_address(dst_in), *dst_port_opt);
+        } else if (protocol == "TCP6") {
+            // Parse IPv6 addresses
+            struct in6_addr src_in6, dst_in6;
+            const char* src_cstr = to_cstr(src_addr_str, src_addr_buf, sizeof(src_addr_buf));
+            const char* dst_cstr = to_cstr(dst_addr_str, dst_addr_buf, sizeof(dst_addr_buf));
+            if (!src_cstr || !dst_cstr) {
+                co_return std::nullopt;
+            }
+            if (inet_pton(AF_INET6, src_cstr, &src_in6) != 1) {
+                co_return std::nullopt;
+            }
+            if (inet_pton(AF_INET6, dst_cstr, &dst_in6) != 1) {
+                co_return std::nullopt;
+            }
+
+            header.remote_address = ipv6_addr(inet_address(src_in6), *src_port_opt);
+            header.local_address = ipv6_addr(inet_address(dst_in6), *dst_port_opt);
+        } else {
+            co_return std::nullopt;
+        }
+
+        co_return header;
     }
-    co_return header;
+
+    // Neither v1 nor v2 signature found
+    co_return std::nullopt;
 }
 
 static
@@ -675,7 +854,7 @@ posix_server_socket_impl::accept() {
 
         std::optional<proxy_protocol_v2_header> proxy_protocol_header_opt;
         if (_proxy_protocol) {
-            proxy_protocol_header_opt = co_await read_proxy_protocol_v2_header(fd);
+            proxy_protocol_header_opt = co_await read_proxy_protocol_header(fd);
             if (!proxy_protocol_header_opt) {
                 continue; // drop the connection
             }
@@ -708,7 +887,7 @@ posix_server_socket_impl::accept() {
             co_return accept_result{connected_socket(std::move(csi)), sa};
         } else {
             // FIXME: future is discarded
-            (void)smp::submit_to(cpu, [protocol = _protocol, ssa = _sa, fd = std::move(fd.get_file_desc()), sa, cth = std::move(cth), ppho = std::move(proxy_protocol_header_opt), allocator = _allocator] () mutable {
+            (void)smp::submit_to(cpu, [protocol = _protocol, ssa = _sa, fd = std::move(fd.get_file_desc()), sa = sa, cth = std::move(cth), ppho = std::move(proxy_protocol_header_opt), allocator = _allocator] () mutable {
                 posix_ap_server_socket_impl::move_connected_socket(protocol, ssa, pollable_fd(std::move(fd)), sa, std::move(cth), std::move(ppho), allocator);
             });
         }
