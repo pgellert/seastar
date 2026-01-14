@@ -455,6 +455,8 @@ private:
     future<size_t>
     do_read(pollable_fd_state& fd, void* buffer, size_t size);
     future<size_t>
+    do_peek(pollable_fd_state& fd, void* buffer, size_t size);
+    future<size_t>
     do_recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov);
     future<temporary_buffer<char>>
     do_read_some(pollable_fd_state& fd, internal::buffer_allocator* ba);

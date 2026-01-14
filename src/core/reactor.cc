@@ -268,6 +268,18 @@ reactor::do_read(pollable_fd_state& fd, void* buffer, size_t len) {
     });
 }
 
+future<size_t>
+reactor::do_peek(pollable_fd_state& fd, void* buffer, size_t len) {
+    return readable(fd).then([this, &fd, buffer, len] () mutable {
+        auto r = fd.fd.recv(buffer, len, MSG_PEEK | MSG_DONTWAIT);
+        if (!r) {
+            return do_peek(fd, buffer, len);
+        }
+        // Don't speculate after peek since data remains in buffer
+        return make_ready_future<size_t>(*r);
+    });
+}
+
 future<temporary_buffer<char>>
 reactor::do_read_some(pollable_fd_state& fd, internal::buffer_allocator* ba) {
     return fd.readable().then([this, &fd, ba] {
@@ -385,6 +397,10 @@ future<size_t> pollable_fd_state::read_some(uint8_t* buffer, size_t size) {
 
 future<size_t> pollable_fd_state::read_some(const std::vector<iovec>& iov) {
     return engine()._backend->recvmsg(*this, iov);
+}
+
+future<size_t> pollable_fd_state::peek_some(char* buffer, size_t size) {
+    return engine()._backend->peek(*this, buffer, size);
 }
 
 future<temporary_buffer<char>> pollable_fd_state::read_some(internal::buffer_allocator* ba) {

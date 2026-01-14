@@ -663,6 +663,11 @@ reactor_backend_aio::read(pollable_fd_state& fd, void* buffer, size_t len) {
 }
 
 future<size_t>
+reactor_backend_aio::peek(pollable_fd_state& fd, void* buffer, size_t len) {
+    return _r.do_peek(fd, buffer, len);
+}
+
+future<size_t>
 reactor_backend_aio::recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) {
     return _r.do_recvmsg(fd, iov);
 }
@@ -1046,6 +1051,11 @@ future<> reactor_backend_epoll::connect(pollable_fd_state& fd, socket_address& s
 future<size_t>
 reactor_backend_epoll::read(pollable_fd_state& fd, void* buffer, size_t len) {
     return _r.do_read(fd, buffer, len);
+}
+
+future<size_t>
+reactor_backend_epoll::peek(pollable_fd_state& fd, void* buffer, size_t len) {
+    return _r.do_peek(fd, buffer, len);
 }
 
 future<size_t>
@@ -1594,6 +1604,9 @@ public:
     }
     virtual future<size_t> read(pollable_fd_state& fd, void* buffer, size_t len) override {
         return _r.do_read(fd, buffer, len);
+    }
+    virtual future<size_t> peek(pollable_fd_state& fd, void* buffer, size_t len) override {
+        return _r.do_peek(fd, buffer, len);
     }
     virtual future<size_t> recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) override {
         if (fd.take_speculation(POLLIN)) {
