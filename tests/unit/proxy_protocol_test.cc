@@ -27,6 +27,8 @@
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 
+#include <fmt/format.h>
+#include <string>
 #include <vector>
 
 // Comprehensive tests for proxy protocol v2 implementation
@@ -566,4 +568,245 @@ SEASTAR_THREAD_TEST_CASE(proxy_protocol_v2_unspec_family) {
     // UNSPEC family (0x0) should only be valid with LOCAL command
     auto header = make_proxy_v2_header(true, 0x21, 0x00);  // v2 PROXY with UNSPEC (invalid combo)
     test_proxy_header_negative(ipv4_addr("127.0.0.1", 12016), std::move(header));
+}
+
+// ============================================================================
+// Proxy Protocol v1 Tests
+// ============================================================================
+
+// Helper to format a v1 header string
+static std::string make_proxy_v1_header(
+    const std::string& proto,
+    const std::string& src_addr,
+    const std::string& dst_addr,
+    uint16_t src_port,
+    uint16_t dst_port) {
+    return fmt::format("PROXY {} {} {} {} {}\r\n", proto, src_addr, dst_addr, src_port, dst_port);
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_tcp4_addresses) {
+    listen_options lo;
+    lo.reuse_address = true;
+    lo.proxy_protocol = true;
+
+    auto listen_addr = ipv4_addr("127.0.0.1", 12100);
+    server_socket ss = seastar::listen(listen_addr, lo);
+
+    auto expected_remote = ipv4_addr("192.168.1.100", 5000);
+    auto expected_local = ipv4_addr("10.0.0.1", 8080);
+
+    auto server = run_server_accept(ss);
+
+    auto header = make_proxy_v1_header("TCP4", "192.168.1.100", "10.0.0.1", 5000, 8080);
+    auto client = seastar::async([&listen_addr, header = std::move(header)] {
+        auto s = connect(listen_addr).get();
+        auto out = s.output();
+        out.write(header.data(), header.size()).get();
+        out.flush().get();
+        out.close().get();
+    });
+
+    auto [addrs] = when_all_succeed(std::move(server), std::move(client)).get();
+    ss.abort_accept();
+
+    BOOST_REQUIRE_EQUAL(addrs.remote, socket_address(expected_remote));
+    BOOST_REQUIRE_EQUAL(addrs.local, socket_address(expected_local));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_tcp6_addresses) {
+    listen_options lo;
+    lo.reuse_address = true;
+    lo.proxy_protocol = true;
+
+    auto listen_addr = ipv6_addr("::1", 12101);
+    server_socket ss = seastar::listen(listen_addr, lo);
+
+    auto expected_remote = ipv6_addr("2001:db8::1", 5000);
+    auto expected_local = ipv6_addr("2001:db8::2", 8080);
+
+    auto server = run_server_accept(ss);
+
+    auto header = make_proxy_v1_header("TCP6", "2001:db8::1", "2001:db8::2", 5000, 8080);
+    auto client = seastar::async([&listen_addr, header = std::move(header)] {
+        auto s = connect(listen_addr).get();
+        auto out = s.output();
+        out.write(header.data(), header.size()).get();
+        out.flush().get();
+        out.close().get();
+    });
+
+    auto [addrs] = when_all_succeed(std::move(server), std::move(client)).get();
+    ss.abort_accept();
+
+    BOOST_REQUIRE_EQUAL(addrs.remote, socket_address(expected_remote));
+    BOOST_REQUIRE_EQUAL(addrs.local, socket_address(expected_local));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_extreme_ports) {
+    listen_options lo;
+    lo.reuse_address = true;
+    lo.proxy_protocol = true;
+
+    auto listen_addr = ipv4_addr("127.0.0.1", 12102);
+    server_socket ss = seastar::listen(listen_addr, lo);
+
+    auto server = run_server_accept(ss);
+
+    auto header = make_proxy_v1_header("TCP4", "192.168.1.100", "10.0.0.1", 0, 65535);
+    auto client = seastar::async([&listen_addr, header = std::move(header)] {
+        auto s = connect(listen_addr).get();
+        auto out = s.output();
+        out.write(header.data(), header.size()).get();
+        out.flush().get();
+        out.close().get();
+    });
+
+    auto [addrs] = when_all_succeed(std::move(server), std::move(client)).get();
+    ss.abort_accept();
+
+    BOOST_REQUIRE_EQUAL(addrs.remote.port(), 0);
+    BOOST_REQUIRE_EQUAL(addrs.local.port(), 65535);
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_compressed_ipv6) {
+    listen_options lo;
+    lo.reuse_address = true;
+    lo.proxy_protocol = true;
+
+    auto listen_addr = ipv6_addr("::1", 12103);
+    server_socket ss = seastar::listen(listen_addr, lo);
+
+    auto server = run_server_accept(ss);
+
+    // Test with compressed IPv6 addresses
+    auto header = make_proxy_v1_header("TCP6", "::1", "::ffff:192.168.1.1", 5000, 8080);
+    auto client = seastar::async([&listen_addr, header = std::move(header)] {
+        auto s = connect(listen_addr).get();
+        auto out = s.output();
+        out.write(header.data(), header.size()).get();
+        out.flush().get();
+        out.close().get();
+    });
+
+    auto [addrs] = when_all_succeed(std::move(server), std::move(client)).get();
+    ss.abort_accept();
+
+    BOOST_REQUIRE_EQUAL(addrs.remote.port(), 5000);
+    BOOST_REQUIRE_EQUAL(addrs.local.port(), 8080);
+}
+
+// Negative tests for v1
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_unknown) {
+    // UNKNOWN protocol should drop the connection
+    std::string header = "PROXY UNKNOWN\r\n";
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12104), std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_unknown_with_addresses) {
+    // UNKNOWN protocol with addresses should also drop the connection
+    std::string header = "PROXY UNKNOWN 192.168.1.100 10.0.0.1 5000 8080\r\n";
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12105), std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_missing_crlf) {
+    std::string header = "PROXY TCP4 192.168.1.100 10.0.0.1 5000 8080";  // No CRLF
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12106), std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_invalid_protocol) {
+    std::string header = "PROXY UDP4 192.168.1.100 10.0.0.1 5000 8080\r\n";
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12107), std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_invalid_ip_address) {
+    std::string header = "PROXY TCP4 invalid 10.0.0.1 5000 8080\r\n";
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12108), std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_missing_fields) {
+    std::string header = "PROXY TCP4 192.168.1.100 10.0.0.1 5000\r\n";  // Missing dst port
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12109), std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_port_out_of_range) {
+    std::string header = "PROXY TCP4 192.168.1.100 10.0.0.1 70000 8080\r\n";
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12110), std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_port_negative) {
+    std::string header = "PROXY TCP4 192.168.1.100 10.0.0.1 -1 8080\r\n";
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12111), std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_lowercase_invalid) {
+    std::string header = "proxy tcp4 192.168.1.100 10.0.0.1 5000 8080\r\n";
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12112), std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_wrong_signature) {
+    std::string header = "NOTPROXY TCP4 192.168.1.100 10.0.0.1 5000 8080\r\n";
+    test_proxy_header_negative(ipv4_addr("127.0.0.1", 12113), std::vector<char>(header.begin(), header.end()));
+}
+
+// Test that application data after the proxy protocol header is not consumed
+// by the header parsing. This verifies that peek_some correctly peeks without
+// consuming, and that read_some only consumes the exact header bytes.
+static void test_proxy_protocol_preserves_application_data(
+        ipv4_addr listen_addr,
+        socket_address expected_remote,
+        socket_address expected_local,
+        std::vector<char> header) {
+    listen_options lo;
+    lo.reuse_address = true;
+    lo.proxy_protocol = true;
+
+    auto ss = seastar::listen(listen_addr, lo);
+    std::string app_data = "Hello, World! This is application data.";
+
+    auto server = seastar::async([&ss, &app_data, &expected_remote, &expected_local] {
+        auto ar = ss.accept().get();
+        BOOST_REQUIRE_EQUAL(ar.connection.remote_address(), expected_remote);
+        BOOST_REQUIRE_EQUAL(ar.connection.local_address(), expected_local);
+
+        auto in = ar.connection.input();
+        auto buf = in.read().get();
+        BOOST_REQUIRE_EQUAL(buf.size(), app_data.size());
+        std::string received(buf.get(), app_data.size());
+        BOOST_REQUIRE_EQUAL(received, app_data);
+
+        in.close().get();
+        ar.connection.shutdown_output();
+    });
+
+    auto client = seastar::async([&listen_addr, &header, &app_data] {
+        auto s = connect(listen_addr).get();
+        auto out = s.output();
+        out.write(header.data(), header.size()).get();
+        out.write(app_data.data(), app_data.size()).get();
+        out.flush().get();
+        out.close().get();
+    });
+
+    when_all_succeed(std::move(server), std::move(client)).get();
+    ss.abort_accept();
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v1_preserves_application_data) {
+    auto header = make_proxy_v1_header("TCP4", "192.168.1.100", "10.0.0.1", 5000, 8080);
+    test_proxy_protocol_preserves_application_data(
+            ipv4_addr("127.0.0.1", 12114),
+            socket_address(ipv4_addr("192.168.1.100", 5000)),
+            socket_address(ipv4_addr("10.0.0.1", 8080)),
+            std::vector<char>(header.begin(), header.end()));
+}
+
+SEASTAR_THREAD_TEST_CASE(proxy_protocol_v2_preserves_application_data) {
+    auto expected_remote = ipv4_addr("192.168.1.100", 5000);
+    auto expected_local = ipv4_addr("10.0.0.1", 8080);
+    test_proxy_protocol_preserves_application_data(
+            ipv4_addr("127.0.0.1", 12115),
+            socket_address(expected_remote),
+            socket_address(expected_local),
+            make_proxy_v2_header(true, 0x21, 0x11, expected_remote, expected_local));
 }

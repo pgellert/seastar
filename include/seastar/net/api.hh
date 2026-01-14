@@ -447,7 +447,8 @@ struct listen_options {
     // as specified in the proxy protocol header. load_balancing_algorithm::port
     // will use the port from the proxy protocol header.
     //
-    // Currently only proxy protocol v2 binary format is supported.
+    // Both proxy protocol v1 (text) and v2 (binary) formats are supported.
+    // The format is auto-detected based on the first byte of the header.
     //
     // The proxy protocol is defined in https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
     bool proxy_protocol = false;
