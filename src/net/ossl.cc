@@ -179,6 +179,10 @@ std::system_error make_ossl_error(const std::string & msg, std::vector<ossl_errc
         fmt::format("{}: {}", msg, error_codes));
 }
 
+std::runtime_error make_unknown_ossl_error(const std::string & msg) {
+    return std::runtime_error(fmt::format("{}: {}", msg, get_all_ossl_errors()));
+}
+
 std::system_error make_ossl_error(const std::string & msg) {
     return make_ossl_error(msg, get_all_ossl_errors());
 }
@@ -1151,7 +1155,7 @@ public:
         default:
         {
             // Some other unhandled situation
-            auto err = std::runtime_error(
+            auto err = make_unknown_ossl_error(
                 "Unknown error encountered during SSL write");
             return handle_output_error(std::move(err)).then([] {
                 return stop_iteration::yes;
@@ -1301,7 +1305,7 @@ public:
                             return handle_output_error(std::move(err));
                         }
                         default:
-                            auto err = std::runtime_error(
+                            auto err = make_ossl_error(
                             "Unknown error encountered during handshake");
                             return handle_output_error(std::move(err));
                         }
@@ -1426,7 +1430,7 @@ public:
                         return make_exception_future<buf_type>(_error);
                     }
                 default:
-                    _error = std::make_exception_ptr(std::runtime_error(
+                    _error = std::make_exception_ptr(make_unknown_ossl_error(
                       "Unexpected error condition during SSL read"));
                     return make_exception_future<buf_type>(_error);
                 }
@@ -1511,7 +1515,7 @@ public:
             }
             default:
             {
-                auto err = std::runtime_error(
+                auto err = make_unknown_ossl_error(
                   "Unknown error occurred during SSL shutdown");
                 return handle_output_error(std::move(err));
             }
