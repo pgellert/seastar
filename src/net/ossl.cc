@@ -1953,7 +1953,7 @@ private:
 
     ssl_ctx_ptr make_ssl_context(session_type type) {
         auto ssl_ctx = ssl_ctx_ptr(SSL_CTX_new(TLS_method()));
-        if (!ssl_ctx) {
+        if (!ssl_ctx || ERR_peek_error() != 0) {
             throw make_ossl_error(
               "Failed to initialize SSL context");
         }
