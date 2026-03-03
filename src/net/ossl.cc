@@ -157,6 +157,19 @@ std::vector<ossl_errc> get_all_ossl_errors() {
     return error_codes;
 }
 
+void log_and_clear_ossl_errors(std::string_view call_site) {
+    if (auto errors = get_all_ossl_errors(); !errors.empty()) {
+        tls_log.debug("{}: unexpected errors in OpenSSL queue: {}", call_site, errors);
+    }
+}
+
+void log_ossl_error_queue(std::string_view call_site) {
+    if (auto err = ERR_peek_error(); err != 0) {
+        tls_log.debug("{}: errors present in OpenSSL error queue: {}", call_site,
+                      static_cast<ossl_errc>(err));
+    }
+}
+
 std::system_error make_ossl_error(const std::string & msg, std::vector<ossl_errc> error_codes) {
     if (error_codes.empty()) {
         return std::system_error{
@@ -479,7 +492,9 @@ public:
         x509_ptr cert;
         switch(fmt) {
         case tls::x509_crt_format::PEM:
+            log_ossl_error_queue("parse_x509_cert: before PEM_read_bio_X509");
             cert = x509_ptr(PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr));
+            log_ossl_error_queue("parse_x509_cert: PEM_read_bio_X509");
             break;
         case tls::x509_crt_format::DER:
             cert = x509_ptr(d2i_X509_bio(cert_bio.get(), nullptr));
@@ -500,7 +515,9 @@ public:
                 if (!info->x509) {
                     throw make_ossl_error("Failed to parse x509 cert");
                 }
+                log_ossl_error_queue("set_x509_trust: before X509_STORE_add_cert");
                 X509_STORE_add_cert(*this, info->x509);
+                log_ossl_error_queue("set_x509_trust: X509_STORE_add_cert");
             });
             break;
         case tls::x509_crt_format::DER:
@@ -508,7 +525,9 @@ public:
             if (!cert) {
                 throw make_ossl_error("Failed to parse x509 certificate");
             }
+            log_ossl_error_queue("set_x509_trust: before X509_STORE_add_cert");
             X509_STORE_add_cert(*this, cert.get());
+            log_ossl_error_queue("set_x509_trust: X509_STORE_add_cert");
             break;
         }
     }
@@ -543,7 +562,9 @@ public:
         evp_pkey_ptr pkey;
         switch(fmt) {
         case x509_crt_format::PEM:
+            log_ossl_error_queue("set_x509_key: before PEM_read_bio_PrivateKey");
             pkey = evp_pkey_ptr(PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr));
+            log_ossl_error_queue("set_x509_key: PEM_read_bio_PrivateKey");
             // The provided `cert` blob may contain more than one cert.  We need to be prepared
             // for this situation.  So we will parse through the blob using `iterate_pem_certs`.
             // The first cert encountered will be assigned to x509_cert and all subsequent certs
@@ -559,7 +580,9 @@ public:
                     // x509_cert X509 ptr
                     info->x509 = nullptr;
                 } else {
+                    log_ossl_error_queue("set_x509_key: before X509_STORE_add_cert");
                     X509_STORE_add_cert(*this, info->x509);
+                    log_ossl_error_queue("set_x509_key: X509_STORE_add_cert");
                 }
             });
             break;
@@ -605,7 +628,9 @@ public:
                 auto num_elements = sk_X509_num(ca_ptr.get());
                 while (num_elements > 0) {
                     auto e = sk_X509_pop(ca_ptr.get());
+                    log_ossl_error_queue("set_simple_pkcs12: before X509_STORE_add_cert");
                     X509_STORE_add_cert(*this, e);
+                    log_ossl_error_queue("set_simple_pkcs12: X509_STORE_add_cert");
                     // store retains certificate
                     X509_free(e);
                     num_elements -= 1;
@@ -1076,6 +1101,19 @@ public:
         return _type == session_type::CLIENT ? "Client": "Server";
     }
 
+    void log_and_clear_ossl_errors(std::string_view call_site) {
+        if (auto errors = get_all_ossl_errors(); !errors.empty()) {
+            tls_log.debug("{} {}: unexpected errors in OpenSSL queue: {}", *this, call_site, errors);
+        }
+    }
+
+    void log_ossl_error_queue(std::string_view call_site) {
+        if (auto err = ERR_peek_error(); err != 0) {
+            tls_log.debug("{} {}: errors present in OpenSSL error queue: {}", *this, call_site,
+                          static_cast<ossl_errc>(err));
+        }
+    }
+
     // This function waits for the _output_pending future to resolve
     // If an error occurs, it is saved off into _error and returned
     future<> wait_for_output() {
@@ -1184,6 +1222,7 @@ public:
                                 return make_ready_future<stop_iteration>(stop_iteration::yes);
                             }
                             size_t bytes_written = 0;
+                            log_and_clear_ossl_errors("do_put: SSL_write_ex");
                             auto write_rc = SSL_write_ex(
                                 _ssl.get(), frag_view.data(), frag_view.size(), &bytes_written);
                             tls_log.trace("{} do_put: SSL_write_ex: {}", *this, write_rc);
@@ -1192,6 +1231,7 @@ public:
                                 tls_log.trace("{} do_put: SSL_get_error: {}", *this, ssl_err);
                                 return handle_do_put_ssl_err(ssl_err);
                             } else {
+                                log_ossl_error_queue("do_put: SSL_write_ex success");
                                 tls_log.trace("{} do_put: bytes_written: {}", *this, bytes_written);
                                 frag_view.remove_prefix(bytes_written);
                                 p.trim_front(bytes_written);
@@ -1261,6 +1301,7 @@ public:
             [this] { return connected() || eof(); },
             [this] {
                 try {
+                    log_and_clear_ossl_errors("do_handshake: SSL_do_handshake");
                     auto n = SSL_do_handshake(_ssl.get());
                     tls_log.trace("{} do_handshake: SSL_do_handshake: {}", *this, n);
                     if (n <= 0) {
@@ -1310,6 +1351,7 @@ public:
                             return handle_output_error(std::move(err));
                         }
                     } else {
+                        log_ossl_error_queue("do_handshake: SSL_do_handshake success");
                         if (_type == session_type::CLIENT
                             || _creds->get_client_auth() != client_auth::NONE) {
                             verify();
@@ -1372,6 +1414,7 @@ public:
             tls_log.trace("{} do_get: available: {}", *this, avail);
             buf_type buf(avail);
             size_t bytes_read = 0;
+            log_and_clear_ossl_errors("do_get: SSL_read_ex");
             auto read_result = SSL_read_ex(
               _ssl.get(), buf.get_write(), avail, &bytes_read);
             tls_log.trace("{} do_get: SSL_read_ex: {}", *this, read_result);
@@ -1435,6 +1478,7 @@ public:
                     return make_exception_future<buf_type>(_error);
                 }
             } else {
+                log_ossl_error_queue("do_get: SSL_read_ex success");
                 buf.trim(bytes_read);
                 return make_ready_future<buf_type>(std::move(buf));
             }
@@ -1467,9 +1511,11 @@ public:
             return make_ready_future();
         }
 
+        log_and_clear_ossl_errors("do_shutdown: SSL_shutdown");
         auto res = SSL_shutdown(_ssl.get());
         tls_log.trace("{} do_shutdown: SSL_shutdown: {}", *this, res);
         if (res == 1) {
+            log_ossl_error_queue("do_shutdown: SSL_shutdown success");
             return wait_for_output();
         } else if (res == 0) {
             return yield().then([this] { return do_shutdown(); });
@@ -1600,7 +1646,8 @@ public:
     future<> handshake() {
         tls_log.trace("{} handshake", *this);
         if (_creds->need_load_system_trust()) {
-            if (!SSL_CTX_set_default_verify_paths(_ctx.get())) {
+            log_ossl_error_queue("handshake: before SSL_CTX_set_default_verify_paths");
+            if (!SSL_CTX_set_default_verify_paths(_ctx.get()) || ERR_peek_error() != 0) {
                 throw make_ossl_error(
                   "Could not load system trust");
             }
@@ -2064,6 +2111,7 @@ private:
         // Servers must supply both certificate and key, clients may
         // optionally use these
         if (ck_pair) {
+            log_ossl_error_queue("make_ssl_context: before SSL_CTX_use_cert_and_key");
             if (!SSL_CTX_use_cert_and_key(
                   ssl_ctx.get(),
                   ck_pair.cert.get(),
@@ -2073,6 +2121,7 @@ private:
                 throw make_ossl_error(
                   "Failed to load cert/key pair");
             }
+            log_ossl_error_queue("make_ssl_context: SSL_CTX_use_cert_and_key");
         }
         // Increments the reference count of *_creds, now should have a
         // total ref count of two, will be deallocated when both OpenSSL and
@@ -2080,20 +2129,24 @@ private:
         SSL_CTX_set1_cert_store(ssl_ctx.get(), *_creds);
 
         if (!_creds->get_cipher_string().empty()) {
+            log_ossl_error_queue("make_ssl_context: before SSL_CTX_set_cipher_list");
             if (SSL_CTX_set_cipher_list(ssl_ctx.get(),
                     _creds->get_cipher_string().c_str()) != 1) {
                 throw make_ossl_error(
                     fmt::format(
                         "Failed to set cipher string '{}'", _creds->get_cipher_string()));
             }
+            log_ossl_error_queue("make_ssl_context: SSL_CTX_set_cipher_list");
         }
 
         if (!_creds->get_ciphersuites().empty()) {
+            log_ossl_error_queue("make_ssl_context: before SSL_CTX_set_ciphersuites");
             if (SSL_CTX_set_ciphersuites(ssl_ctx.get(), _creds->get_ciphersuites().c_str()) != 1) {
                 throw make_ossl_error(
                     fmt::format(
                         "Failed to set ciphersuites '{}'", _creds->get_ciphersuites()));
             }
+            log_ossl_error_queue("make_ssl_context: SSL_CTX_set_ciphersuites");
         }
         const auto& alpn_protocols = type == session_type::CLIENT ? _options.alpn_protocols : _creds->_alpn_protocols;
         // ALPN setup
