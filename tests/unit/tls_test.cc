@@ -1594,3 +1594,87 @@ SEASTAR_THREAD_TEST_CASE(test_tls13_session_tickets) {
     }
 
 }
+
+// Verify that a system_category error (ENODATA) from the underlying transport
+// propagates through the TLS layer with its error code and category preserved,
+// rather than being wrapped as a GnuTLS/OpenSSL error.
+SEASTAR_THREAD_TEST_CASE(test_enodata_propagation_through_tls) {
+    tls::credentials_builder b;
+
+    b.set_x509_key_file(certfile("test.crt"), certfile("test.key"), tls::x509_crt_format::PEM).get();
+    b.set_x509_trust_file(certfile("catest.pem"), tls::x509_crt_format::PEM).get();
+    b.set_dh_level();
+
+    auto creds = b.build_certificate_credentials();
+    auto serv = b.build_server_credentials();
+
+    // Custom connected_socket_impl that can inject ENODATA on the read path.
+    // This simulates a kernel recv returning ENODATA, which should bypass
+    // the TLS error handling and propagate as-is.
+    class enodata_socket_impl : public loopback_connected_socket_impl {
+    public:
+        bool inject_enodata = false;
+
+        enodata_socket_impl(lw_shared_ptr<loopback_buffer> tx, lw_shared_ptr<loopback_buffer> rx)
+            : loopback_connected_socket_impl(tx, rx)
+        {}
+
+        data_source source() override {
+            class enodata_source : public data_source_impl {
+                data_source _underlying;
+                bool& _inject;
+            public:
+                enodata_source(data_source underlying, bool& inject)
+                    : _underlying(std::move(underlying)), _inject(inject) {}
+                future<temporary_buffer<char>> get() override {
+                    if (_inject) {
+                        return make_exception_future<temporary_buffer<char>>(
+                            std::system_error(ENODATA, std::system_category()));
+                    }
+                    return _underlying.get();
+                }
+                future<> close() override {
+                    return _underlying.close();
+                }
+            };
+            return data_source(std::make_unique<enodata_source>(
+                loopback_connected_socket_impl::source(), inject_enodata));
+        }
+    };
+
+    auto b1 = make_lw_shared<loopback_buffer>(nullptr, loopback_buffer::type::SERVER_TX);
+    auto b2 = make_lw_shared<loopback_buffer>(nullptr, loopback_buffer::type::CLIENT_TX);
+
+    auto ssi = std::make_unique<enodata_socket_impl>(b1, b2);
+    auto csi = std::make_unique<enodata_socket_impl>(b2, b1);
+
+    auto& server_impl = *ssi;
+
+    auto ss = tls::wrap_server(serv, connected_socket(std::move(ssi))).get();
+    auto cs = tls::wrap_client(creds, connected_socket(std::move(csi))).get();
+
+    // Complete TLS handshake with a successful round-trip
+    auto os = cs.output().detach();
+    auto is = ss.input();
+
+    auto f1 = os.put(temporary_buffer<char>("hello", 5));
+    auto f2 = is.read();
+    f1.get();
+    auto buf = f2.get();
+    BOOST_CHECK_EQUAL(sstring(buf.begin(), buf.end()), "hello");
+
+    // Inject ENODATA on the server's underlying read path
+    server_impl.inject_enodata = true;
+
+    // The next read should propagate ENODATA with system_category
+    try {
+        is.read().get();
+        BOOST_FAIL("expected system_error with ENODATA");
+    } catch (const std::system_error& e) {
+        BOOST_CHECK_EQUAL(e.code().value(), ENODATA);
+        BOOST_CHECK(e.code().category() == std::system_category());
+    }
+
+    try { os.close().get(); } catch (...) {}
+    try { is.close().get(); } catch (...) {}
+}
