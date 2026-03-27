@@ -47,6 +47,11 @@
 
 #include <gnutls/gnutls.h>
 
+#ifdef SEASTAR_USE_OPENSSL
+#include <openssl/err.h>
+#include <openssl/sslerr.h>
+#endif
+
 #if 0
 
 static void enable_gnutls_logging() {
@@ -1678,3 +1683,104 @@ SEASTAR_THREAD_TEST_CASE(test_enodata_propagation_through_tls) {
     try { os.close().get(); } catch (...) {}
     try { is.close().get(); } catch (...) {}
 }
+
+#ifdef SEASTAR_USE_OPENSSL
+
+// Verify that the OpenSSL per-thread error queue does not leak errors
+// between independent TLS sessions running on the same shard. The OpenSSL
+// error queue is thread-local, so without explicit clearing before each
+// SSL_* call, stale errors from one session could be misattributed to
+// another. The ossl backend's log_and_clear_ossl_errors() is called before
+// every SSL_do_handshake / SSL_read_ex / SSL_write_ex to prevent this.
+//
+// Strategy: establish a first TLS session, then poison the thread-local
+// OpenSSL error queue with synthetic errors, and finally establish a second
+// TLS session. If error queue isolation works, the second session completes
+// its handshake and data exchange without being affected by the stale errors.
+SEASTAR_THREAD_TEST_CASE(test_ossl_error_queue_isolation_between_sessions) {
+    auto server_creds = ::make_shared<tls::server_credentials>(
+        ::make_shared<tls::dh_params>());
+    server_creds->set_x509_key_file(
+        certfile("test.crt"), certfile("test.key"),
+        tls::x509_crt_format::PEM).get();
+
+    tls::credentials_builder b;
+    b.set_x509_trust_file(certfile("catest.pem"), tls::x509_crt_format::PEM).get();
+    auto client_creds = b.build_certificate_credentials();
+
+    ::listen_options opts;
+    opts.reuse_address = true;
+    opts.set_fixed_cpu(this_shard_id());
+
+    auto addr = ::make_ipv4_address({0x7f000001, 4712});
+    auto server = tls::listen(server_creds, addr, opts);
+
+    // Session 1: establish and tear down a TLS connection.
+    {
+        auto sa = server.accept();
+        auto c = tls::connect(client_creds, addr,
+            tls::tls_options{.server_name = "test.scylladb.org"}).get();
+        auto s = sa.get();
+
+        auto in = s.connection.input();
+        output_stream<char> out(c.output().detach(), 1024);
+
+        out.write("session1").get();
+        out.flush().get();
+        auto buf = in.read().get();
+        BOOST_REQUIRE_EQUAL(sstring(buf.begin(), buf.end()), "session1");
+
+        in.close().get();
+        out.close().get();
+        s.connection.shutdown_input();
+        s.connection.shutdown_output();
+        c.shutdown_input();
+        c.shutdown_output();
+    }
+
+    // Poison the thread-local OpenSSL error queue with synthetic errors.
+    // This simulates the scenario where a failing TLS session leaves stale
+    // entries on the error queue that a subsequent session might misread.
+    ERR_raise(ERR_LIB_SSL, SSL_R_CERTIFICATE_VERIFY_FAILED);
+    ERR_raise(ERR_LIB_SSL, SSL_R_WRONG_VERSION_NUMBER);
+    BOOST_REQUIRE(ERR_peek_error() != 0);
+
+    // Session 2: must succeed despite the polluted error queue.
+    {
+        auto sa = server.accept();
+        auto c = tls::connect(client_creds, addr,
+            tls::tls_options{.server_name = "test.scylladb.org"}).get();
+        auto s = sa.get();
+
+        auto in = s.connection.input();
+        auto cin = c.input();
+        output_stream<char> out(c.output().detach(), 1024);
+        output_stream<char> sout(s.connection.output().detach(), 1024);
+
+        // Write from client, read on server.
+        out.write("session2-ping").get();
+        out.flush().get();
+        auto buf = in.read().get();
+        BOOST_REQUIRE_EQUAL(sstring(buf.begin(), buf.end()), "session2-ping");
+
+        // Write from server, read on client.
+        sout.write("session2-pong").get();
+        sout.flush().get();
+        auto cbuf = cin.read().get();
+        BOOST_REQUIRE_EQUAL(sstring(cbuf.begin(), cbuf.end()), "session2-pong");
+
+        in.close().get();
+        out.close().get();
+        cin.close().get();
+        sout.close().get();
+        s.connection.shutdown_input();
+        s.connection.shutdown_output();
+        c.shutdown_input();
+        c.shutdown_output();
+    }
+
+    // Verify the error queue is clean after properly-functioning sessions.
+    BOOST_REQUIRE_EQUAL(ERR_peek_error(), 0UL);
+}
+
+#endif // SEASTAR_USE_OPENSSL
