@@ -1989,6 +1989,13 @@ private:
             throw make_ossl_error(
               "Failed to initialize SSL context");
         }
+        // SSL_CTX_new can return a valid context while leaving errors on the
+        // error queue from partially-failed system config parsing (e.g. an
+        // invalid Ciphersuites value in the system openssl.cnf).
+        // See https://github.com/openssl/openssl/issues/30760
+        if (auto errors = get_all_ossl_errors(); !errors.empty()) {
+            tls_log.warn("SSL_CTX_new left errors on the queue: {}", errors);
+        }
         const auto& ck_pair = _creds->get_certkey_pair();
         if (type == session_type::SERVER) {
             if (!ck_pair) {
