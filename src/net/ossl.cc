@@ -1195,6 +1195,7 @@ public:
         // This do_until runs until either a renegotiation occurs or the packet is empty
         while (!eof() && size > 0) {
             size_t bytes_written = 0;
+            verify_clean_error_queue("SSL_write_ex");
             auto write_rc = SSL_write_ex(_ssl.get(), ptr, size, &bytes_written);
             tls_log.trace("{} do_put: SSL_write_ex: {}", *this, write_rc);
             if (write_rc != 1) {
@@ -1286,6 +1287,7 @@ public:
             [this] { return connected() || eof(); },
             [this] {
                 try {
+                    verify_clean_error_queue("SSL_do_handshake");
                     auto n = SSL_do_handshake(_ssl.get());
                     tls_log.trace("{} do_handshake: SSL_do_handshake: {}", *this, n);
                     if (n <= 0) {
@@ -1397,6 +1399,7 @@ public:
             tls_log.trace("{} do_get: available: {}", *this, avail);
             buf_type buf(avail);
             size_t bytes_read = 0;
+            verify_clean_error_queue("SSL_read_ex");
             auto read_result = SSL_read_ex(
               _ssl.get(), buf.get_write(), avail, &bytes_read);
             tls_log.trace("{} do_get: SSL_read_ex: {}", *this, read_result);
@@ -1492,6 +1495,7 @@ public:
             return make_ready_future();
         }
 
+        verify_clean_error_queue("SSL_shutdown");
         auto res = SSL_shutdown(_ssl.get());
         tls_log.trace("{} do_shutdown: SSL_shutdown: {}", *this, res);
         if (res == 1) {
@@ -1825,6 +1829,22 @@ SEASTAR_INTERNAL_END_IGNORE_DEPRECATIONS
     }
 
 private:
+    // Checks that the OpenSSL per-thread error queue is clean before
+    // calling an SSL function.  A dirty queue can cause SSL_get_error
+    // to misclassify results (e.g. reporting SSL_ERROR_SYSCALL instead
+    // of SSL_ERROR_SSL), which can affect unrelated sessions that share
+    // the same thread.
+    void verify_clean_error_queue(const char* operation) {
+        auto err = ERR_peek_error();
+        if (err == 0) [[likely]] {
+            return;
+        }
+        char buf[256];
+        ERR_error_string_n(err, buf, sizeof(buf));
+        tls_log.warn("{} stale error on queue before {}: {}", *this, operation, buf);
+        SEASTAR_ASSERT(0 && "stale errors on OpenSSL error queue");
+    }
+
     std::vector<subject_alt_name> do_get_alt_name_information(const x509_ptr &peer_cert,
                                                               const std::unordered_set<subject_alt_name_type> &types) const {
         int ext_idx = X509_get_ext_by_NID(
