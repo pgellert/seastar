@@ -183,8 +183,12 @@ std::system_error make_ossl_error(const std::string & msg) {
     return make_ossl_error(msg, get_all_ossl_errors());
 }
 
+std::runtime_error make_unknown_ossl_error(const std::string & msg, std::vector<ossl_errc> error_codes) {
+    return std::runtime_error(fmt::format("{}: {}", msg, error_codes));
+}
+
 std::runtime_error make_unknown_ossl_error(const std::string & msg) {
-    return std::runtime_error(fmt::format("{}: {}", msg, get_all_ossl_errors()));
+    return make_unknown_ossl_error(msg, get_all_ossl_errors());
 }
 
 bool contains_ossl_error(const std::vector<ossl_errc> & error_codes, int lib, int reason) {
@@ -1105,6 +1109,8 @@ public:
 
     // Helper function for handling the SSL errors in do_put
     future<stop_iteration> handle_do_put_ssl_err(const int ssl_err) {
+        auto error_codes = get_all_ossl_errors();
+        tls_log.debug("{} do_put: SSL error {}: {}", *this, ssl_err, error_codes);
         switch(ssl_err) {
         case SSL_ERROR_ZERO_RETURN:
             // Indicates a hang up somewhere
@@ -1133,13 +1139,12 @@ public:
             });
         case SSL_ERROR_SYSCALL:
         {
-            auto err = make_ossl_error("System error encountered during SSL write");
+            auto err = make_ossl_error("System error encountered during SSL write", std::move(error_codes));
             return handle_output_error(std::move(err)).then([] {
                 return stop_iteration::yes;
             });
         }
         case SSL_ERROR_SSL: {
-            auto error_codes = get_all_ossl_errors();
             if (contains_ossl_error(error_codes, ERR_LIB_SSL, SSL_R_UNEXPECTED_EOF_WHILE_READING)) {
                 // Probably shouldn't happen during a write, but
                 // let's handle this gracefully
@@ -1156,7 +1161,7 @@ public:
         {
             // Some other unhandled situation
             auto err = make_unknown_ossl_error(
-                "Unknown error encountered during SSL write");
+                "Unknown error encountered during SSL write", std::move(error_codes));
             return handle_output_error(std::move(err)).then([] {
                 return stop_iteration::yes;
             });
@@ -1198,6 +1203,11 @@ public:
             verify_clean_error_queue("SSL_write_ex");
             auto write_rc = SSL_write_ex(_ssl.get(), ptr, size, &bytes_written);
             tls_log.trace("{} do_put: SSL_write_ex: {}", *this, write_rc);
+            if (auto eq = ERR_peek_error(); eq != 0) {
+                char eqbuf[256];
+                ERR_error_string_n(eq, eqbuf, sizeof(eqbuf));
+                tls_log.warn("{} do_put: error queue dirty after SSL_write_ex({}): {}", *this, write_rc, eqbuf);
+            }
             if (write_rc != 1) {
                 const auto ssl_err = SSL_get_error(_ssl.get(), write_rc);
                 tls_log.trace("{} do_put: SSL_get_error: {}", *this, ssl_err);
@@ -1206,6 +1216,7 @@ public:
                     co_return;
                 }
             } else {
+                ERR_clear_error();
                 SEASTAR_ASSERT(bytes_written <= size);
                 tls_log.trace("{} do_put: bytes_written: {}", *this, bytes_written);
                 ptr += bytes_written;
@@ -1290,6 +1301,11 @@ public:
                     verify_clean_error_queue("SSL_do_handshake");
                     auto n = SSL_do_handshake(_ssl.get());
                     tls_log.trace("{} do_handshake: SSL_do_handshake: {}", *this, n);
+                    if (auto eq = ERR_peek_error(); eq != 0) {
+                        char eqbuf[256];
+                        ERR_error_string_n(eq, eqbuf, sizeof(eqbuf));
+                        tls_log.warn("{} do_handshake: error queue dirty after SSL_do_handshake({}): {}", *this, n, eqbuf);
+                    }
                     if (n <= 0) {
                         auto ssl_error = SSL_get_error(_ssl.get(), n);
                         tls_log.trace("{} do_handshake: SSL_get_error: {}", *this, ssl_error);
@@ -1337,6 +1353,7 @@ public:
                             return handle_output_error(std::move(err));
                         }
                     } else {
+                        ERR_clear_error();
                         if (_type == session_type::CLIENT
                             || _creds->get_client_auth() != client_auth::NONE) {
                             verify();
@@ -1403,6 +1420,11 @@ public:
             auto read_result = SSL_read_ex(
               _ssl.get(), buf.get_write(), avail, &bytes_read);
             tls_log.trace("{} do_get: SSL_read_ex: {}", *this, read_result);
+            if (auto eq = ERR_peek_error(); eq != 0) {
+                char eqbuf[256];
+                ERR_error_string_n(eq, eqbuf, sizeof(eqbuf));
+                tls_log.warn("{} do_get: error queue dirty after SSL_read_ex({}): {}", *this, read_result, eqbuf);
+            }
             tls_log.trace("{} do_get: SSL_read_ex bytes_ready: {}", *this, bytes_read);
             if (read_result != 1) {
                 const auto ssl_err = SSL_get_error(_ssl.get(), read_result);
@@ -1499,8 +1521,30 @@ public:
         auto res = SSL_shutdown(_ssl.get());
         tls_log.trace("{} do_shutdown: SSL_shutdown: {}", *this, res);
         if (res == 1) {
+            // Per OpenSSL docs, SSL_shutdown returning 1 means "successfully shut down"
+            // call again" and is not an error. SSL_get_error must not be
+            // called. The error queue may contain stale entries (e.g. from a
+            // BIO write failure that SSL_shutdown absorbed internally), so
+            // drain it before retrying.
+            if (auto err = ERR_peek_error(); err != 0) {
+                char buf[256];
+                ERR_error_string_n(err, buf, sizeof(buf));
+                tls_log.debug("{} do_shutdown: draining stale error after SSL_shutdown returned 1: {}", *this, buf);
+                ERR_clear_error();
+            }
             return wait_for_output();
         } else if (res == 0) {
+            // Per OpenSSL docs, SSL_shutdown returning 0 means "in progress,
+            // call again" and is not an error. SSL_get_error must not be
+            // called. The error queue may contain stale entries (e.g. from a
+            // BIO write failure that SSL_shutdown absorbed internally), so
+            // drain it before retrying.
+            if (auto err = ERR_peek_error(); err != 0) {
+                char buf[256];
+                ERR_error_string_n(err, buf, sizeof(buf));
+                tls_log.debug("{} do_shutdown: draining stale error after SSL_shutdown returned 0: {}", *this, buf);
+                ERR_clear_error();
+            }
             return yield().then([this] { return do_shutdown(); });
         } else {
             auto ssl_err = SSL_get_error(_ssl.get(), res);
@@ -2008,6 +2052,7 @@ private:
     }
 
     ssl_ctx_ptr make_ssl_context(session_type type) {
+        verify_clean_error_queue("SSL_CTX_new");
         auto ssl_ctx = ssl_ctx_ptr(SSL_CTX_new(TLS_method()));
         if (!ssl_ctx) {
             throw make_ossl_error(
